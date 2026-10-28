@@ -56,6 +56,98 @@ defmodule Mint.WebSocketTest do
     end
   end
 
+  describe "given an HTTP/1 connection with :max_message_size" do
+    setup do
+      host = System.get_env("ECHO_HOST") || "localhost"
+      {:ok, conn} = HTTP1.connect(:http, host, 9000)
+      {:ok, conn, ref} = WebSocket.upgrade(:ws, conn, "/", [])
+      assert_receive http_get_message
+
+      {:ok, conn, [{:status, ^ref, status}, {:headers, ^ref, resp_headers}, {:done, ^ref}]} =
+        WebSocket.stream(conn, http_get_message)
+
+      {:ok, conn, websocket} =
+        WebSocket.new(conn, ref, status, resp_headers, max_message_size: 100)
+
+      on_exit(fn -> HTTP1.close(conn) end)
+      [websocket: websocket]
+    end
+
+    test "a frame declaring a length over the limit is rejected from its header",
+         %{websocket: websocket} do
+      # text frame header declaring a 4 GB payload, followed by a few bytes
+      header = <<1::1, 0::3, 1::4, 0::1, 127::7, 4_294_967_296::64>>
+
+      assert {:error, _websocket, %Mint.WebSocketError{reason: :message_too_large}} =
+               WebSocket.decode(websocket, header <> "abc")
+    end
+
+    test "a fragmented message over the limit is rejected", %{websocket: websocket} do
+      # 60 bytes each: first text frame (FIN = 0), then the final continuation (FIN = 1)
+      first = <<0::1, 0::3, 1::4, 0::1, 60::7>> <> :binary.copy("a", 60)
+      last = <<1::1, 0::3, 0::4, 0::1, 60::7>> <> :binary.copy("a", 60)
+
+      assert {:ok, websocket, []} = WebSocket.decode(websocket, first)
+
+      assert {:error, _websocket, %Mint.WebSocketError{reason: :message_too_large}} =
+               WebSocket.decode(websocket, last)
+    end
+
+    test "a fragmented message of exactly the limit is delivered", %{websocket: websocket} do
+      first = <<0::1, 0::3, 1::4, 0::1, 60::7>> <> :binary.copy("a", 60)
+      last = <<1::1, 0::3, 0::4, 0::1, 40::7>> <> :binary.copy("a", 40)
+
+      assert {:ok, websocket, []} = WebSocket.decode(websocket, first)
+      assert {:ok, _websocket, [{:text, message}]} = WebSocket.decode(websocket, last)
+      assert byte_size(message) == 100
+    end
+  end
+
+  describe "given an HTTP/1 connection with compression and :max_message_size" do
+    setup do
+      {:ok, conn} = HTTP1.connect(:http, "localhost", 7070)
+
+      {:ok, conn, ref} =
+        WebSocket.upgrade(:ws, conn, "/", [], extensions: [WebSocket.PerMessageDeflate])
+
+      assert_receive http_get_message
+
+      {:ok, conn, [{:status, ^ref, status}, {:headers, ^ref, resp_headers}, {:done, ^ref}]} =
+        WebSocket.stream(conn, http_get_message)
+
+      {:ok, conn, websocket} =
+        WebSocket.new(conn, ref, status, resp_headers, max_message_size: 100)
+
+      on_exit(fn -> HTTP1.close(conn) end)
+      [conn: conn, ref: ref, websocket: websocket]
+    end
+
+    test "a compressed message inflating over the limit is rejected", c do
+      # 1,000 identical bytes compress to a frame far below the limit
+      {:ok, websocket, data} = WebSocket.encode(c.websocket, {:text, :binary.copy("a", 1_000)})
+      {:ok, conn} = WebSocket.stream_request_body(c.conn, c.ref, data)
+
+      assert_receive echo_message
+      {:ok, _conn, [{:data, _ref, data}]} = WebSocket.stream(conn, echo_message)
+
+      assert byte_size(data) < 100
+
+      assert {:error, _websocket, %Mint.WebSocketError{reason: :message_too_large}} =
+               WebSocket.decode(websocket, data)
+    end
+
+    test "a compressed message inflating exactly to the limit is delivered", c do
+      message = :binary.copy("a", 100)
+      {:ok, websocket, data} = WebSocket.encode(c.websocket, {:text, message})
+      {:ok, conn} = WebSocket.stream_request_body(c.conn, c.ref, data)
+
+      assert_receive echo_message
+      {:ok, _conn, [{:data, _ref, data}]} = WebSocket.stream(conn, echo_message)
+
+      assert {:ok, _websocket, [{:text, ^message}]} = WebSocket.decode(websocket, data)
+    end
+  end
+
   describe "given a passive HTTP/1 connection to an echo server" do
     setup do
       host = System.get_env("ECHO_HOST") || "localhost"
